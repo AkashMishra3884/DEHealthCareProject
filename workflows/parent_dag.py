@@ -1,8 +1,8 @@
-import airflow
 from airflow import DAG
 from datetime import timedelta
 from airflow.utils.dates import days_ago
-from airflow.operators.dagrun_operator import TriggerDagRunOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
 
 # Define default arguments
 ARGS = {
@@ -20,7 +20,7 @@ ARGS = {
 # Define the parent DAG
 with DAG(
     dag_id="parent_dag",
-    schedule_interval="0 5 * * *",``
+    schedule_interval="0 5 * * *",
     description="Parent DAG to trigger PySpark and BigQuery DAGs",
     default_args=ARGS,
     tags=["parent", "orchestration", "etl"]
