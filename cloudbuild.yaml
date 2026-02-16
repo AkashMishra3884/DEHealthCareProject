@@ -22,4 +22,4 @@ substitutions:
   _DATA_DIRECTORY: "data/"
 
   #finalendra sencidn see
-  # _DAGS_BUCKET: "us-central1-demo-instance-a649b781-bucket" # Replace with your Composer bucket --- IGNORE ---
+  # _DAGS_BUCKET: "us-cendadasdasdadtral1-demo-instance-a649b781-bucket" # Replace with your Composer bucket --- IGNORE ---
