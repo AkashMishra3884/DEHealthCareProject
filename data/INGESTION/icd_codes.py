@@ -87,4 +87,4 @@ df = spark.createDataFrame(icd_codes, schema=schema)
 # df.show()
 
 # Save to Parquet
-df.write.format("parquet").mode("append").save("gs://healthcare-bucket-22032025/landing/icd_codes/")
+df.write.format("parquet").mode("append").save("gs://healthcare13022025/landing/icd_codes/")
