@@ -1,43 +1,53 @@
 from google.cloud import storage, bigquery
-import pandas as pd
 from pyspark.sql import SparkSession
 import datetime
 import json
 
-# Initialize GCS & BigQuery Clients
+# -----------------------------
+# INIT CLIENTS
+# -----------------------------
 storage_client = storage.Client()
 bq_client = bigquery.Client()
 
-# Initialize Spark Session
-spark = SparkSession.builder.appName("HospitalAMySQLToLanding").getOrCreate()
+spark = SparkSession.builder.appName("HospitalA_CSV_To_Landing").getOrCreate()
 
-# Google Cloud Storage (GCS) Configuration
+# -----------------------------
+# CONFIG
+# -----------------------------
 GCS_BUCKET = "healthcare13022025"
-HOSPITAL_NAME = "hospital-b"
-LANDING_PATH = f"gs://{GCS_BUCKET}/landing/{HOSPITAL_NAME}/"
-ARCHIVE_PATH = f"gs://{GCS_BUCKET}/landing/{HOSPITAL_NAME}/archive/"
-CONFIG_FILE_PATH = f"gs://{GCS_BUCKET}/configs/load_config.csv"
 
-# BigQuery Configuration
+HOSPITAL_NAME = "hospital-a"
+
+# SOURCE CSV PATH (already exists)
+SOURCE_BASE_PATH = f"gs://{GCS_BUCKET}/data/hosp-a/"
+
+# TARGET LANDING PATH (BigQuery reads from here)
+LANDING_BASE_PATH = f"gs://{GCS_BUCKET}/landing/{HOSPITAL_NAME}/"
+
+# BigQuery Audit
 BQ_PROJECT = "lithe-land-345711"
 BQ_AUDIT_TABLE = f"{BQ_PROJECT}.temp_dataset.audit_log"
-BQ_LOG_TABLE = f"{BQ_PROJECT}.temp_dataset.pipeline_logs"
-BQ_TEMP_PATH = f"{GCS_BUCKET}/temp/"  
+BQ_TEMP_BUCKET = GCS_BUCKET
 
-# MySQL Configuration
-MYSQL_CONFIG = {
-    "url": "jdbc:mysql://34.59.188.6:3306/hospital_b_db?useSSL=false&allowPublicKeyRetrieval=true",
-    "driver": "com.mysql.cj.jdbc.Driver",
-    "user": "myuser",
-    "password": "mypass"
-}
 
-##------------------------------------------------------------------------------------------------------------------##
-# Logging Mechanism
-log_entries = []  # Stores logs before writing to GCS
+# -----------------------------
+# TABLE LIST
+# -----------------------------
+TABLES = [
+    "departments",
+    "providers",
+    "patients",
+    "encounters",
+    "transactions"
+]
+
+
+# -----------------------------
+# LOGGING
+# -----------------------------
+log_entries = []
 
 def log_event(event_type, message, table=None):
-    """Log an event and store it in the log list"""
     log_entry = {
         "timestamp": datetime.datetime.now().isoformat(),
         "event_type": event_type,
@@ -45,139 +55,106 @@ def log_event(event_type, message, table=None):
         "table": table
     }
     log_entries.append(log_entry)
-    print(f"[{log_entry['timestamp']}] {event_type} - {message}")  # Print for visibility
-    
-def save_logs_to_gcs():
-    """Save logs to a JSON file and upload to GCS"""
-    log_filename = f"pipeline_log_{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}.json"
-    log_filepath = f"temp/pipeline_logs/{log_filename}"  
-    
-    json_data = json.dumps(log_entries, indent=4)
+    print(f"[{log_entry['timestamp']}] {event_type} - {message}")
 
-    # Get GCS bucket
-    bucket = storage_client.bucket(GCS_BUCKET)
-    blob = bucket.blob(log_filepath)
-    
-    # Upload JSON data as a file
-    blob.upload_from_string(json_data, content_type="application/json")
 
-    print(f"✅ Logs successfully saved to GCS at gs://{GCS_BUCKET}/{log_filepath}")
+# -----------------------------
+# ARCHIVE OLD JSON
+# -----------------------------
+def move_existing_json_to_archive(table):
+    """
+    Moves old JSON files from landing/<table>/ to landing/archive/<table>/yyyy/mm/dd/
+    """
+    prefix = f"landing/{HOSPITAL_NAME}/{table}/"
+    blobs = list(storage_client.bucket(GCS_BUCKET).list_blobs(prefix=prefix))
 
-def save_logs_to_bigquery():
-    """Save logs to BigQuery"""
-    if log_entries:
-        log_df = spark.createDataFrame(log_entries)
-        log_df.write.format("bigquery") \
-            .option("table", BQ_LOG_TABLE) \
-            .option("temporaryGcsBucket", BQ_TEMP_PATH) \
-            .mode("append") \
-            .save()
-        print("✅ Logs stored in BigQuery for future analysis")
-    
-##------------------------------------------------------------------------------------------------------------------##
+    json_files = [b.name for b in blobs if b.name.endswith(".json")]
 
-# Function to Move Existing Files to Archive
-def move_existing_files_to_archive(table):
-    blobs = list(storage_client.bucket(GCS_BUCKET).list_blobs(prefix=f"landing/{HOSPITAL_NAME}/{table}/"))
-    existing_files = [blob.name for blob in blobs if blob.name.endswith(".json")]
-
-    if not existing_files:
-        log_event("INFO", f"No existing files for table {table}")
+    if not json_files:
+        log_event("INFO", f"No existing JSON files to archive for {table}", table=table)
         return
 
-    for file in existing_files:
+    now = datetime.datetime.now()
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
+
+    for file in json_files:
         source_blob = storage_client.bucket(GCS_BUCKET).blob(file)
-
-        # Extract Date from File Name
-        date_part = file.split("_")[-1].split(".")[0]
-        year, month, day = date_part[-4:], date_part[2:4], date_part[:2]
-
-        # Move to Archive
         archive_path = f"landing/{HOSPITAL_NAME}/archive/{table}/{year}/{month}/{day}/{file.split('/')[-1]}"
-        destination_blob = storage_client.bucket(GCS_BUCKET).blob(archive_path)
 
-        # Copy file to archive and delete original
-        storage_client.bucket(GCS_BUCKET).copy_blob(source_blob, storage_client.bucket(GCS_BUCKET), destination_blob.name)
+        storage_client.bucket(GCS_BUCKET).copy_blob(
+            source_blob,
+            storage_client.bucket(GCS_BUCKET),
+            archive_path
+        )
         source_blob.delete()
 
-        log_event("INFO", f"Moved {file} to {archive_path}", table=table)
-        
-##------------------------------------------------------------------------------------------------------------------##
+    log_event("SUCCESS", f"Archived {len(json_files)} JSON files for {table}", table=table)
 
-# Function to Get Latest Watermark from BigQuery Audit Table
-def get_latest_watermark(table_name):
-    query = f"""
-        SELECT MAX(load_timestamp) AS latest_timestamp
-        FROM `{BQ_AUDIT_TABLE}`
-        WHERE tablename = '{table_name}' and data_source = "hospital_b_db"
-    """
-    query_job = bq_client.query(query)
-    result = query_job.result()
-    for row in result:
-        return row.latest_timestamp if row.latest_timestamp else "1900-01-01 00:00:00"
-    return "1900-01-01 00:00:00"
 
-##------------------------------------------------------------------------------------------------------------------##
+# -----------------------------
+# WRITE AUDIT LOG
+# -----------------------------
+def write_audit_log(table, load_type, record_count, status):
+    audit_df = spark.createDataFrame([
+        ("hospital_a_db", table, load_type, int(record_count), datetime.datetime.now(), status)
+    ], ["data_source", "tablename", "load_type", "record_count", "load_timestamp", "status"])
 
-# Function to Extract Data from MySQL and Save to GCS
-def extract_and_save_to_landing(table, load_type, watermark_col):
+    (audit_df.write.format("bigquery")
+        .option("table", BQ_AUDIT_TABLE)
+        .option("temporaryGcsBucket", BQ_TEMP_BUCKET)
+        .mode("append")
+        .save())
+
+
+# -----------------------------
+# MAIN INGESTION
+# -----------------------------
+def csv_to_landing_json(table):
     try:
-        last_watermark = get_latest_watermark(table) if load_type.lower() == "incremental" else None
-        log_event("INFO", f"Latest watermark for {table}: {last_watermark}", table=table)
+        csv_path = f"{SOURCE_BASE_PATH}{table}.csv"
+        output_path = f"{LANDING_BASE_PATH}{table}/"
 
-        query = f"(SELECT * FROM {table}) AS t" if load_type.lower() == "full" else \
-                f"(SELECT * FROM {table} WHERE {watermark_col} > '{last_watermark}') AS t"
+        log_event("INFO", f"Reading CSV from: {csv_path}", table=table)
 
-        df = (spark.read.format("jdbc")
-                .option("url", MYSQL_CONFIG["url"])
-                .option("user", MYSQL_CONFIG["user"])
-                .option("password", MYSQL_CONFIG["password"])
-                .option("driver", MYSQL_CONFIG["driver"])
-                .option("dbtable", query)
-                .load())
+        df = spark.read.option("header", "true").csv(csv_path)
 
-        log_event("SUCCESS", f"✅ Successfully extracted data from {table}", table=table)
+        record_count = df.count()
+        log_event("INFO", f"Record count in CSV for {table}: {record_count}", table=table)
 
-        today = datetime.datetime.today().strftime('%d%m%Y')
-        JSON_FILE_PATH = f"landing/{HOSPITAL_NAME}/{table}/{table}_{today}.json"
+        # If CSV is empty, skip writing
+        if record_count == 0:
+            log_event("WARNING", f"No data in CSV for {table}. Skipping write.", table=table)
+            write_audit_log(table, "Full", 0, "SUCCESS")
+            return
 
-        bucket = storage_client.bucket(GCS_BUCKET)
-        blob = bucket.blob(JSON_FILE_PATH)
-        blob.upload_from_string(df.toPandas().to_json(orient="records", lines=True), content_type="application/json")
+        # Archive old JSON
+        move_existing_json_to_archive(table)
 
-        log_event("SUCCESS", f"✅ JSON file successfully written to gs://{GCS_BUCKET}/{JSON_FILE_PATH}", table=table)
-        
-        # Insert Audit Entry
-        audit_df = spark.createDataFrame([
-            ("hospital_b_db", table, load_type, df.count(), datetime.datetime.now(), "SUCCESS")], 
-            ["data_source", "tablename", "load_type", "record_count", "load_timestamp", "status"])
+        # Write JSON using Spark (correct way)
+        log_event("INFO", f"Writing JSON to: {output_path}", table=table)
 
-        (audit_df.write.format("bigquery")
-            .option("table", BQ_AUDIT_TABLE)
-            .option("temporaryGcsBucket", GCS_BUCKET)
-            .mode("append")
-            .save())
+        df.write.mode("overwrite").json(output_path)
 
-        log_event("SUCCESS", f"✅ Audit log updated for {table}", table=table)
+        log_event("SUCCESS", f"JSON written successfully for {table}", table=table)
+
+        # Audit update
+        write_audit_log(table, "Full", record_count, "SUCCESS")
+        log_event("SUCCESS", f"Audit log updated for {table}", table=table)
 
     except Exception as e:
-        log_event("ERROR", f"Error processing {table}: {str(e)}", table=table)
-##------------------------------------------------------------------------------------------------------------------##
+        log_event("ERROR", f"Failed for {table}: {str(e)}", table=table)
+        try:
+            write_audit_log(table, "Full", 0, "FAILED")
+        except:
+            pass
 
-# Function to Read Config File from GCS
-def read_config_file():
-    df = spark.read.csv(CONFIG_FILE_PATH, header=True)
-    log_event("INFO", "✅ Successfully read the config file")
-    return df
 
-# read config file
-config_df = read_config_file()
+# -----------------------------
+# RUN ALL TABLES
+# -----------------------------
+for t in TABLES:
+    csv_to_landing_json(t)
 
-for row in config_df.collect():
-    if row["is_active"] == '1' and row["datasource"] == "hospital_b_db": 
-        db, src, table, load_type, watermark, _, targetpath = row
-        move_existing_files_to_archive(table)
-        extract_and_save_to_landing(table, load_type, watermark)
-        
-save_logs_to_gcs()
-save_logs_to_bigquery()
+log_event("SUCCESS", "Hospital A CSV → Landing JSON completed for all tables")
