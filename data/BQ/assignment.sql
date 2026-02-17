@@ -1,4 +1,4 @@
--- 4. Financial Metrics (Gold) : Aggregates financial KPIs, such as total revenue, claim success rate, and outstanding balances.
+-- 4. Financial Metrics (Go   ld) : Aggregates financial KPIs, such as total revenue, claim success rate, and outstanding balances.
 
 CREATE TABLE IF NOT EXISTS `lithe-land-345711.gold_dataset.financial_metrics` AS
 SELECT 
